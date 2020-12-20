@@ -1,0 +1,2 @@
+# AFP
+Applied Finance Project
