@@ -1,0 +1,922 @@
+import numpy as np
+import pandas as pd
+from pandas.tseries.offsets import *
+import datetime as dt
+import copy 
+import matplotlib.pyplot as plt
+import statsmodels.api as sm
+from itertools import product
+import os
+os.chdir("/Users/charlesrambo/Desktop/AFP/sector-classification-trading-strategies/data/train")
+
+# Load clusters 
+clusters = pd.read_csv("clusters_train.csv")
+
+# Load CRSP data
+crsp_stocks = pd.read_csv("CRSP_train.csv")
+
+# Load link table
+link = pd.read_csv("link.csv")
+
+# Load Compustat data
+compustat = pd.read_csv("compustat_train.csv")
+
+
+# In[341]:
+
+
+# Convert to CRSP and Compustat dates to date time objects
+crsp_stocks['date'] = pd.to_datetime(crsp_stocks['date'], format = "%Y-%m-%d") 
+compustat['datadate'] = pd.to_datetime(compustat['datadate'], format = "%Y%m%d")
+
+# Introduce year and month variables 
+crsp_stocks['year'] = crsp_stocks['date'].dt.year
+crsp_stocks['month'] = crsp_stocks['date'].dt.month
+crsp_stocks['week'] = crsp_stocks['date'].dt.week
+crsp_stocks['day'] = crsp_stocks['date'].dt.dayofweek
+
+# Drop unneeded variables
+compustat = compustat.drop('cusip', axis = 1)
+
+# Make all prices positive
+crsp_stocks["PRC"] = crsp_stocks["PRC"].abs()
+
+# Exchange codes 31, 32, and 33 are NOT included
+crsp_stocks = crsp_stocks.loc[crsp_stocks.EXCHCD.isin([1, 2, 3, 31, 32, 33])]
+    
+# Only consider share codes 10 and 11
+crsp_stocks = crsp_stocks.loc[crsp_stocks.SHRCD.isin([10, 11])]
+
+# Remove unknowns
+unknowns = ["-66.0", "-77.0", "-88.0", "-99.0", "-99.99", "-999", "A", "B", "C", "D", "E", "S", "T", "P"]
+convert_unknowns = lambda x: np.nan if x in unknowns else x
+
+crsp_stocks['RET'] = crsp_stocks['RET'].apply(convert_unknowns).astype(float)
+crsp_stocks['DLRET'] = crsp_stocks['DLRET'].apply(convert_unknowns).astype(float)
+
+link['LINKDT'] = link['LINKDT'].apply(convert_unknowns)
+
+# Only consider stocks where at least one of delisting or holding returns is defined
+crsp_stocks = crsp_stocks.loc[crsp_stocks['DLRET'].notna() | crsp_stocks['RET'].notna()]
+
+# Convert link table dates 
+link['LINKDT'] = pd.to_datetime(link['LINKDT'], format = "%Y-%m-%d") 
+
+link['LINKENDDT'] = link['LINKENDDT'].apply(convert_unknowns)  
+link['LINKENDDT'] = pd.to_datetime(link['LINKENDDT'], format = "%Y-%m-%d")
+
+# Fill missing with date out of range
+link['LINKENDDT'] = link['LINKENDDT'].fillna(pd.to_datetime('20200525', format = "%Y%m%d")) 
+
+# Only keep LINKPRIM of P and C
+link = link.loc[link['LINKPRIM'].isin(["P", "C"])]
+
+# Only consider LIID of 01
+link = link.loc[link["LIID"] == '01']
+
+
+# In[342]:
+
+
+# Construct array of unique PERMNOS
+PERMNOS = np.unique(crsp_stocks['PERMNO'])
+
+# Construct dataframe to hold date PERMNO pairs
+products = pd.DataFrame()
+
+for PERMNO in PERMNOS:
+    
+    # Subset to just the PERMNO
+    temp = crsp_stocks.loc[crsp_stocks['PERMNO'] == PERMNO, ['date', 'PERMNO']]
+    
+    # Get date range of all Fridays within start and end of crsp_stocks, inclusive
+    dates = pd.date_range(temp['date'].min(), temp['date'].max(), freq = 'D')
+    
+    # Convert to dataframe
+    dates  = pd.DataFrame(dates, columns = ['date'])
+    
+    # Left join of date range with the date and PERMNO dataframe
+    temp = dates.merge(temp, how = 'left', on = 'date')
+    
+    # Remove all observations without the PERMNO
+    temp = temp.loc[temp['PERMNO'].notna(), :]
+    
+    # Stack our observations
+    products = pd.concat([temp, products])
+
+# Do a left join with crsp_stocks, so have all Fridays within start and end of CRSP stocks
+crsp_stocks = products.merge(crsp_stocks, how = 'left', on = ['date', 'PERMNO'])
+
+# Drop obervations with missing PERMNO
+crsp_stocks = crsp_stocks.loc[crsp_stocks['PERMNO'].notna(), :]
+
+# Fill 'RET_mod' nan's with zero
+crsp_stocks['RET_mod'].fillna(0, inplace = True)
+
+
+# In[343]:
+
+
+# Convert to log returns
+crsp_stocks['RET_mod'] = np.log(1 + crsp_stocks['RET_mod'])
+
+# Construct weekly returns
+crsp_stocks['RET_mod'] = crsp_stocks.groupby(['PERMNO', 'year', 'week'])['RET_mod'].transform(lambda x: x.sum(skipna = True))
+
+
+# In[344]:
+
+
+len(crsp_stocks)
+
+
+# In[345]:
+
+
+# Sort data for shift (redundent)
+crsp_stocks.sort_values(by = ['PERMNO', 'date'], inplace = True)
+
+# Construct lagged price
+crsp_stocks['lag_PRC'] = crsp_stocks.groupby('PERMNO')['PRC'].transform(lambda x: x.shift(5))
+
+# Only consider Fridays
+crsp_stocks = crsp_stocks.loc[crsp_stocks['date'].dt.dayofweek == 4, :]
+
+# Drop unneeded columns
+crsp_stocks.drop(['CUSIP', 'RET', 'day', 'week', 'SHRCD', 'DLRET', 'EXCHCD', 'PRC'], axis = 1, inplace = True)
+
+
+# In[346]:
+
+
+crsp_stocks
+
+[p  bh77898yhb                                                 bhhg b.   ]
+
+
+# In[347]:
+
+
+# Sort variables
+crsp_stocks.sort_values(by = ['PERMNO', 'date'], inplace = True)
+
+# Reset index
+crsp_stocks.reset_index(drop = True, inplace = True)
+
+# How many weeks in a month?
+weeks_in_month = 4
+
+# Initialize monthly returns
+crsp_stocks['RET_mon'] = np.nan
+
+# Iteratively fill monthly returns
+for i in range(weeks_in_month - 1, 2, -1):
+    
+    # Record missing values
+    missing = crsp_stocks['RET_mon'].isna()
+    
+    # Construct IsValid
+    crsp_stocks['IsValid'] = crsp_stocks[['PERMNO', 'date']].groupby('PERMNO')['date'].transform(lambda x: (x.shift(-i) - x - dt.timedelta(weeks = i)).abs() <= dt.timedelta(days = 3))
+    
+    crsp_stocks.loc[crsp_stocks['IsValid'].isna(), 'IsValid'] = False
+
+    # Initialize RET_mon backup
+    crsp_stocks['backup'] = crsp_stocks[['PERMNO', 'RET_mod']].groupby('PERMNO')['RET_mod'].transform(lambda x: x.shift(-i).rolling(i + 1).sum())
+    
+    # Replace invalid monthly returns with np.nan
+    crsp_stocks.loc[crsp_stocks['IsValid'] == True, 'backup'] = np.nan
+    
+    # Fill missing values in RET_mon with corresponging rows of backup
+    crsp_stocks.loc[missing, 'RET_mon'] = crsp_stocks.loc[missing, 'backup']
+      
+# Drop unneeded columns
+crsp_stocks.drop(['backup', 'IsValid'], axis = 1, inplace = True)
+
+
+# In[348]:
+
+
+len(crsp_stocks)
+
+
+# In[349]:
+
+
+# Fill missing values
+compustat[['at','lt','pstkl','txditc','dcvt']] = compustat[['at','lt','pstkl','txditc','dcvt']].fillna(0)
+
+# Construct book equity
+compustat['be'] = compustat['at'] - compustat['lt'] - compustat['pstkl'] + compustat['txditc'] + compustat['dcvt']
+
+# Drop unneeded columns
+compustat.drop(['at', 'lt', 'pstkl', 'txditc', 'dcvt', 'indfmt', "consol", "popsrc", "datafmt", "curcd", "costat", 'consol'], axis = 1, inplace = True)
+
+# Sort by date
+compustat.sort_values(by = 'datadate', inplace = True) 
+
+# Fill missing SICH with previous SICH of same gvkey 
+compustat['sich'] = compustat.groupby('gvkey')['sich'].transform(lambda x: x.ffill())
+
+# All other observations with missing SICH codes are not helpful
+compustat = compustat.loc[compustat['sich'].notna(), :]
+
+# Merge Compustat and Hoberg data
+df = compustat.merge(clusters, left_on = ["gvkey", "fyear"] , right_on = ["gvkey", "year"])
+
+# Merge df with link table
+df = df.merge(link, on = "gvkey")
+
+# Verify that date within valid range
+df = df.loc[(df['LINKDT'] < df['datadate']) & (df['datadate'] < df['LINKENDDT'])]
+
+# Drop unneeded variabbles
+df = df.drop(['conm', 'LINKPRIM', 'LIID', 'fyear', 'datadate', 'gvkey', "LINKDT", "LINKENDDT"], axis = 1)
+
+# Delete unneeded data
+del compustat
+del clusters
+del link
+del unknowns
+
+
+# In[350]:
+
+
+df
+
+
+# In[351]:
+
+
+# Merge df and CRSP data
+df_1 = crsp_stocks.merge(df, left_on = ['PERMNO', 'year'], right_on = ['LPERMNO', 'year'], how = "left")
+df['year'] = 1 + df['year']
+df_2 = crsp_stocks.merge(df, left_on = ['PERMNO', 'year'], right_on = ['LPERMNO', 'year'], how = "left")
+
+del crsp_stocks
+
+# Use accounting data reported during current year after June, otherwise use accounting data reported in previous year
+df_1 = df_1.loc[df_1['month'] > 6]
+df_2 = df_2.loc[df_2['month'] <= 6]
+
+
+# In[352]:
+
+
+# Concatinate two dataframes
+df = pd.concat([df_1, df_2], ignore_index = True)
+df.reset_index(drop = True, inplace = True)
+
+del df_1
+del df_2
+
+
+# In[353]:
+
+
+df.head()
+
+
+# In[354]:
+
+
+def scale_to_fill(dataframe, string1, string2):
+    
+    # Construct deep copy to values do not enter dataframe
+    data = copy.deepcopy(dataframe)
+    
+    # Construct scalar
+    data['scalar'] = data[string1]/data[string2]
+    
+    # Forward fill scalar
+    # data['scalar'] = data.groupby('PERMNO')['scalar'].transform(lambda x: x.ffill())
+    data['scalar'] = data.groupby('PERMNO')['scalar'].transform('ffill')
+    
+    # Replace missing values with scaled value
+    data.loc[data[string1].isna(), string1] = data.loc[data[string1].isna(), 'scalar'] * data.loc[data[string1].isna(), string2]
+    
+    # Drop scalar
+    data.drop('scalar', axis = 1, inplace = True)
+    
+    return(data[string1])
+       
+
+
+# In[365]:
+
+
+def fill_with_mean(dataframe, string):
+    
+    # Construct deep copy to values do not enter dataframe
+    data = copy.deepcopy(dataframe)
+    
+    # Record missing values
+    missing = data[string].notna()
+    
+    # Calculate mean
+    data['mean'] = data.groupby(['PERMNO', 'date'])[string].transform('mean')
+    
+    # Construct scalar
+    data['scalar'] = data[string]/data['mean']
+    
+    # Forward fill missing values
+    data['scalar'] = data.groupby('PERMNO')['scalar'].transform('ffill')
+    
+    # Replace missing values with scaled mean
+    data[missing, string] = data.loc[missing, 'scalar'] * data.loc[missing, 'mean']
+    
+    return(data[string])
+       
+
+
+# In[356]:
+
+
+# Define lag between sort a execution; lag = 1, 2, ..., 6 in paper
+lag = 1
+
+# Define number of weeks used to construct returns for sort
+sort_length = 1
+
+# Sort values
+df.sort_values(by = ['PERMNO', 'date'], inplace = True)
+
+# Calculate fundemental return; equal weighted within cluster
+df['fund'] = df.groupby(['date', 'cluster'])['RET_mod'].transform('mean')
+
+# Calculate SIC return; equal weighted within SIC
+df['ind'] = df.groupby(['date', 'sich'])['RET_mod'].transform('mean')
+
+# Calculate firm return minus industry return 
+df['r-ind'] = df['RET_mod'] - df['ind']
+
+# Calculate official minus fundemental
+df['ind-fund'] = df['ind'] - df['fund']
+
+if sort_length == 1:
+    
+    # Construct IsValid for shift
+    df['IsValid'] = df.groupby('PERMNO')['date'].transform(lambda x: x == x.shift(lag) + dt.timedelta(weeks = lag))
+    
+    # Shift results
+    df['r-ind'] = df.groupby('PERMNO')['r-ind'].transform(lambda x: x.shift(lag))
+    df['ind-fund'] = df.groupby('PERMNO')['ind-fund'].transform(lambda x: x.shift(lag))
+    
+    # Use IsValid
+    df.loc[df['IsValid'] == False, 'r-ind'] = np.nan
+    df.loc[df['IsValid'] == False, 'ind-fund'] = np.nan
+
+else:
+    
+    # Construct is valid
+    df['IsValid'] = df.groupby('PERMNO')['date'].transform(lambda x: x == x.shift(lag + sort_length - 1) + dt.timedelta(weeks = lag + sort_length - 1))
+    
+    # Shift results and calculate rolling sum
+    df['r-ind'] = df.groupby('PERMNO')['r-ind'].transform(lambda x: x.shift(lag).rolling(sort_length).sum())
+    df['ind-fund'] = df.groupby('PERMNO')['ind-fund'].transform(lambda x: x.shift(lag).rolling(sort_length).sum())
+    
+    # Use IsValid
+    df.loc[df['IsValid'] == False, 'r-ind'] = np.nan
+    df.loc[df['IsValid'] == False, 'ind-fund'] = np.nan
+    
+# Drop IsValid
+df.drop('IsValid', axis = 1, inplace = True)
+
+
+# In[357]:
+
+
+df.head()
+
+
+# In[358]:
+
+
+# Construct dataframe to hold date PERMNO pairs
+products = pd.DataFrame()
+
+for PERMNO in PERMNOS:
+    
+    # Subset to just the PERMNO
+    temp = df.loc[df['PERMNO'] == PERMNO, ['date', 'PERMNO', 'RET_mod', 'r-ind', 'fund']]
+    
+    if temp['date'].notna().sum() > 2:
+    
+        # Get date range of all Fridays within start and end of crsp_stocks, inclusive
+        dates = pd.date_range(temp['date'].min(), temp['date'].max(), freq = 'W-FRI')
+    
+        # Convert to dataframe
+        dates  = pd.DataFrame(dates, columns = ['date'])
+    
+        # Left join of date range with the date and PERMNO dataframe
+        temp = dates.merge(temp, how = 'left', on = 'date')
+    
+        # Remove all observations without the PERMNO
+        temp = temp.loc[temp['PERMNO'].notna(), :]
+    
+    # Stack our observations
+    products = pd.concat([products, temp])
+    
+# Delete temp and PERMNOS
+del temp
+del PERMNOS
+
+# Drop RET_mod and r-ind from df
+df.drop(['r-ind', 'ind'], axis = 1, inplace = True)
+    
+# Drop obervations with missing PERMNO
+products = products.loc[products['PERMNO'].notna(), :]
+
+# Record missing values
+products['flag'] = products['r-ind'].notna()
+
+# Construct r - fund
+products['r-fund'] = products['RET_mod'] - products['fund']
+
+
+# In[359]:
+
+
+X = copy.deepcopy(products)
+
+
+# In[360]:
+
+
+X.loc[X['r-ind'].notna()].head(25)
+
+
+# In[361]:
+
+
+# Construct function to get sigma
+def get_sigma(dataframe, breaks):
+    
+    # Make sure 'r-ind' is the correct datatype
+    dataframe['r-ind'] = dataframe['r-ind'].astype(float)
+    
+    # Construct deep copy so values do not enter dataframe
+    data = copy.deepcopy(dataframe)
+  
+    # Scale to fill
+    #data['r-ind'] = scale_to_fill(products, 'r-ind', 'r-fund')
+    
+    data['r-ind'] = fill_with_mean(data, 'r-ind')
+ 
+    # Find the number of weeks in the break
+    weeks_in_breaks = int(np.ceil(24 * weeks_in_month/breaks))
+    
+    # Sort values again (redundent)
+    data.sort_values(by = ['PERMNO', 'date'], inplace = True)
+    
+    # reset index
+    data.reset_index(drop = True, inplace = True)
+    
+    # How close must the dates line up
+    precision = int(np.max([weeks_in_breaks/7, 1]))
+
+    # Construct new flag
+    data['IsValid'] = data.groupby('PERMNO')['date'].transform(lambda x: (x - x.shift(weeks_in_breaks - 1) - dt.timedelta(weeks = weeks_in_breaks - 1)).abs() <= dt.timedelta(weeks = precision))
+    
+    # Change np.nan IsValids to False
+    data.loc[data['IsValid'].isna(), 'IsValid'] = False
+    
+    # Find backup values
+    data['var1'] = data.groupby('PERMNO')['r-ind'].transform(lambda x: x.rolling(window = weeks_in_breaks - 1).var(skipna = True))
+    
+    # Omit invalid sigmas
+    data.loc[data['IsValid'] == False, 'var1'] = np.nan
+    
+    # Create backup
+    data['backup'] = data.groupby('date')['var1'].transform('mean')
+    
+    # Define how much to forward fill
+    forward_fill = int(np.max([weeks_in_breaks/8, 1])) 
+    
+    # Forward fill missing values with limit
+    data['var1'] = data.groupby('PERMNO')['var1'].transform(lambda x: x.ffill(limit = forward_fill))
+    
+    # Replace 0 values with np.nan
+    data['var1'].replace(0, np.nan, inplace = True)
+    
+    # Scale to fill
+    data['var1'] = scale_to_fill(data, 'var1', 'backup')
+    
+    # Drop backup
+    data.drop('backup', axis = 1, inplace = True)
+      
+    # Initialize sigma
+    data['sigma'] = data['var1']
+    
+    # Begin construction of divisor
+    divisor = data['var1'].notna().astype(int)
+                                                         
+    for i in range(2, breaks + 1):
+        
+        # Redefine IsValud
+        data['IsValid'] = data.groupby('PERMNO')['date'].transform(lambda x: (x.shift((i - 1) * weeks_in_breaks) - x.shift(i * weeks_in_breaks - 1) - dt.timedelta(weeks = weeks_in_breaks - 1)).abs() <= dt.timedelta(weeks = precision))
+        
+        # Shift var1
+        data['var' + str(i)] = data.groupby('PERMNO')['var' + str(i - 1)].transform(lambda x: x.shift(weeks_in_breaks))
+        
+        # Replace nonvalids with np.nan
+        data.loc[data['IsValid'] == False, 'var' + str(i)] = np.nan
+        
+        # Add one to the rows of divisor where vari is defined
+        divisor += data['var' + str(i)].notna().astype(int)
+                                                            
+        # Fill vari with 0 and add to sigma
+        data['sigma'] += data['var' + str(i)].fillna(0)
+        
+        # Drop 'IsValid'
+        #data.drop('IsValid', axis = 1, inplace = True)
+    
+    # Drop the variance variables
+    for i in range(3, breaks + 1):
+        
+        data.drop('var' + str(i), axis = 1, inplace = True)
+        
+    # Take the square root of the rows in sigma and then divid by divisor, which is the number of defined vari
+    data['sigma'] = data['sigma'].apply(np.std)/divisor
+    
+    # Don't accept sigma values where fewer than 70% of vari are defined
+    data.loc[divisor < int(0.8 * breaks), 'sigma'] = np.nan
+    
+    # Omit zero values of sigma
+    data['sigma'].replace(0, np.nan, inplace = True)
+    
+    return(data['var1'])
+
+
+# In[362]:
+
+
+len(products)
+
+
+# In[366]:
+
+
+products.head()
+
+
+# In[ ]:
+
+
+# Construct sigma
+products['sigma'] = get_sigma(products, 5)
+
+# Drop unneeded columns
+products.drop(['fund', 'RET_mod', 'r-fund'], axis = 1, inplace = True)
+
+# Remove junk
+products = products.loc[products['sigma'].notna(), :]
+
+# Construct rho
+products['rho'] = (products['r-ind']/products['sigma']).abs()
+
+# Replace infinite values with np.nan
+products['rho'].replace(np.infty, np.nan, inplace = True)
+
+# Only consider observations where rho is defined 
+products = products.loc[products['rho'].notna() & products['flag'], :]
+
+# Drop unneded columns
+products.drop(['flag', 'sigma'], axis = 1, inplace = True)
+
+
+# In[ ]:
+
+
+len(products)
+
+
+# In[ ]:
+
+
+df
+
+
+# In[ ]:
+
+
+# Do a left join with crsp_stocks, so have all Fridays within start and end of CRSP stocks
+df = products.merge(df, how = 'left', on = ['date', 'PERMNO'])
+
+# Delete products
+del products
+
+df = df.loc[df['sich'].notna(), :]
+
+# Drop duplicates
+df.drop_duplicates(inplace = True)
+
+# Reset index
+df.reset_index(drop = True, inplace = True)
+
+# Only consider LC link when duplicates
+df['count'] = df[['date', 'PERMNO', 'LPERMCO']].groupby(['date', 'LPERMCO']).transform('count')
+
+# Only consider positive book-equity and stock price at least $5
+df = df.loc[(df['be'] > 0) & (df['lag_PRC'] >= 5), :]
+
+# Only consider firms with positive number of shares outstanding
+df = df.loc[df['SHROUT'] > 0]
+
+# Create SIC and cluster counts
+df['sich_count'] = df.groupby(['date', 'sich'])['PERMNO'].transform(lambda x: len(x))
+df['cluster_count'] = df.groupby(['date', 'cluster'])['PERMNO'].transform(lambda x: len(x))
+
+# Only consider firms with more than 5 completing industries based both on SIC and cluster
+df = df.loc[(df['sich_count'] > 4) & (df['cluster_count'] > 4), :]
+
+# If duplicates, only consider the LC link
+df = df.loc[(df['count'] < 2) | (df['LINKTYPE'] == 'LC')]
+
+# Remove unneeded variables
+df.drop(['sich_count', 'be', 'count', 'LPERMNO', 'month', 'LINKTYPE', 'SHROUT'], axis = 1, inplace = True)
+
+
+# Sort dataframe and reset index
+df.sort_values(by = ['PERMNO', 'date'], inplace = True)
+
+# Reset index
+df.reset_index(drop = True, inplace = True)
+
+
+# In[ ]:
+
+
+df['cluster_count'].describe()
+
+
+# In[ ]:
+
+
+len(df)
+
+
+# In[ ]:
+
+
+df.head()
+
+
+# # Replication
+
+# In[ ]:
+
+
+# Create dummy dataframe
+X = copy.deepcopy(df)
+
+# Convert to log returns
+#X['RET_mod'] = (1 + X['RET_mod']).apply(np.log)
+
+# Makre sure date is Friday
+X['date'] = X['date'] + Week(weekday = 4)
+
+# Drop unneeded columns
+X.drop(['year', 'LPERMCO', 'cluster_count'], axis = 1, inplace = True)
+
+
+# In[ ]:
+
+
+# Rho quantiles
+quants1 = 3
+    
+# SIC and fundementals difference quantiles
+quants2 = 5
+
+
+# In[ ]:
+
+
+X
+
+
+# In[ ]:
+
+
+# Sort only works if rho, industrly fundemental, and monthly returns are defined
+X = X.loc[X['rho'].notna() & X['RET_mon'].notna() & X['ind-fund'].notna(), :]
+
+
+# In[ ]:
+
+
+# Drop unneed columns
+X.drop(['cluster', 'sich', 'r-ind'], axis = 1, inplace = True)
+
+
+# In[ ]:
+
+
+# Sort by date
+X.sort_values(by = 'date', inplace = True)
+
+# Get unique dates
+dates = np.unique(X.date)
+
+# Initilize dataframe to record returns
+returns = pd.DataFrame()
+returns['date'] = dates
+returns['Q1'] = np.nan
+returns['Q5'] = np.nan
+returns['Q1-Q5'] = np.nan
+returns['n'] = np.nan
+
+for date in dates:
+    
+    # Only consider opservations in current date; lag_PRC is the price at closing time Thursday
+    # subset = X.loc[(X.date == date) & (X.lag_PRC >= 5)]
+    subset = X.loc[X.date == date]
+    
+    if len(subset) > (1 + quants1):
+    
+        # Construct first sort based on rho
+        subset['sort1'] = 1 + pd.qcut(subset['rho'], quants1, labels = False, duplicates = 'drop')
+    
+        # Only consider smallest values of rho
+        subset = subset.loc[subset.sort1 == 1]
+        
+        
+        # Construct second sort
+        subset['sort2'] = 1 + pd.qcut(subset['ind-fund'], quants2, labels = False, duplicates = 'drop')
+    
+        # Equal weighted returns within each quintile
+        results = subset[['RET_mon', 'sort2']].groupby('sort2')['RET_mon'].mean()
+    
+        try:
+            # Save return data
+            returns.loc[returns.date == date, 'Q1'] = results[1]
+                
+            returns.loc[returns.date == date, 'Q5'] = results[quants2]
+        
+            # Construct long-short portfolio
+            returns.loc[returns.date == date, 'Q1-Q5'] = results[1] - results[quants2]
+                
+        except KeyError:
+                
+            # Save return data
+            returns.loc[returns.date == date, 'Q1'] = results[1]
+                
+            returns.loc[returns.date == date, 'Q5'] = np.nan
+        
+            # Construct long-short portfolio
+            returns.loc[returns.date == date, 'Q1-Q5'] = np.nan
+            
+        # Count number of firms in final quantiles
+        returns.loc[returns.date == date, 'n'] = subset[['RET_mon', 'sort2']].groupby('sort2')['RET_mon'].count()[1]
+            
+         
+
+
+# In[ ]:
+
+
+# Omit rows with na values
+returns.dropna(axis = 0, inplace = True)
+
+# Loop over return columns
+for col in ['Q1', 'Q5', 'Q1-Q5']:
+    # Convert to monthly returns
+    returns[col] = -1 + returns[col].apply(np.exp)
+
+
+# In[ ]:
+
+
+returns.head(25)
+
+
+# # Analysis
+
+# In[ ]:
+
+
+# Load Fama French data
+FF3 = pd.read_csv("FF3-weekly.csv")
+FFMOM = pd.read_csv("FFMOM-daily.csv")
+
+# Convert to datetime object
+FF3['date'] = pd.to_datetime(FF3['date'], format = "%Y%m%d")
+FFMOM['date'] = pd.to_datetime(FFMOM['date'], format = "%Y%m%d") 
+
+## Convert to decimal
+FF3.iloc[:, 1:] = FF3.iloc[:, 1:].div(100)
+FFMOM.iloc[:, 1:] = FFMOM.iloc[:, 1:].div(100)
+
+# Convert daily momentum to weekly momentum
+FFMOM['MOM'] = (1 + FFMOM['MOM']).rolling(window = 5).apply(np.prod, raw = True) - 1
+
+# Merge Fama French data
+FF = FF3.merge(FFMOM, on = 'date')
+
+
+# In[ ]:
+
+
+# Define function to get factor loadings
+def print_loadings(column):
+    Y = returns
+    merged = Y.merge(FF, on = 'date')
+    X =  merged[['Mkt-RF', 'SMB', 'HML', 'MOM']]
+    X = sm.add_constant(X)
+    model = sm.OLS(merged[column]/weeks_in_month, X)
+    OLS = model.fit()
+    print(OLS.summary())
+
+
+# In[ ]:
+
+
+# Loop over columns
+for col in ['Q1', 'Q5', 'Q1-Q5']:
+    print_loadings(col)
+
+
+# In[ ]:
+
+
+# Merge data
+results = returns.merge(FF, on = 'date')
+results['Mkt'] = results['Mkt-RF'] + results['RF']
+results.drop('Mkt-RF', axis = 1, inplace = True)
+
+statistics = pd.DataFrame()
+statistics['mean'] = 52 * results.mean()/weeks_in_month
+statistics['std'] = np.sqrt(52/weeks_in_month) * results.std()
+# Subtracting risk-free rate even from long-short positions
+statistics['Sharpe'] = np.sqrt(52/weeks_in_month) * (results.mean() - results['RF'].mean())/results.std()
+statistics['skew'] = results.skew()
+# Remove unneeded rows
+statistics.drop(['RF', 'n'], axis = 0, inplace = True)
+statistics
+
+
+# In[ ]:
+
+
+results.drop(['RF', 'n'], axis = 1, inplace = True)
+results.corr()
+
+
+# In[ ]:
+
+
+plt.plot(results['date'], (1 + results["Q1-Q5"]).cumprod() - 1, label = "Kruger") 
+plt.plot(results['date'], (1 + results["MOM"]).cumprod() - 1, label = "Fama French Momentum")
+plt.xlabel('date') 
+plt.ylabel('cumlative returns') 
+plt.title('Kruger v Momentum')
+plt.axhline(linewidth = 2, color = 'black')
+plt.legend()
+plt.show()
+
+
+# In[ ]:
+
+
+plt.plot(results['date'], (1 + results["Q1-Q5"]).cumprod() - 1, label = "Kruger") 
+plt.plot(results['date'], (1 + results["SMB"]).cumprod() - 1, label = "Fama French SMB")
+plt.xlabel('date') 
+plt.ylabel('cumlative returns') 
+plt.title('Kruger v SMB')
+plt.axhline(linewidth = 2, color = 'black')
+plt.legend()
+plt.show()
+
+
+# In[ ]:
+
+
+plt.plot(results['date'], (1 + results["Q1-Q5"]).cumprod() - 1, label = "Kruger") 
+plt.plot(results['date'], (1 + results["HML"]).cumprod() - 1, label = "Fama French HML")
+plt.xlabel('date') 
+plt.ylabel('cumlative returns') 
+plt.title('Kruger v HML')
+plt.axhline(linewidth = 2, color = 'black')
+plt.legend()
+plt.show()
+
+
+# In[ ]:
+
+
+plt.plot(results['date'], (1 + results["Q1-Q5"]).cumprod() - 1, label = "Kruger") 
+plt.plot(results['date'], (1 + results["Mkt"]).cumprod() - 1, label = "Fama French Mkt")
+plt.xlabel('date') 
+plt.ylabel('cumlative returns') 
+plt.title('Momentum v Market Returns')
+plt.axhline(linewidth = 2, color = 'black')
+plt.legend()
+plt.show()
+
+
+# In[ ]:
+
+
+
+
